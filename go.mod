@@ -1,6 +1,6 @@
 module github.com/hmage/dnstest
 
-go 1.23.1
+go 1.24
 
 require github.com/miekg/dns v1.1.68
 
