@@ -3,16 +3,18 @@ package dnstest_test
 import (
 	"fmt"
 	"net"
+	"sync"
 	"testing"
 
 	"github.com/hmage/dnstest"
 	"github.com/miekg/dns"
 )
 
+// not using testBind inside ExampleServer() because pkg.go.dev will trim out this const - needs to be self-sufficient
 const testBind = "example.com. 104 A 127.0.0.1\nexample.com. 104 MX 10 mail.example.com."
 
 func ExampleServer() {
-	ts := dnstest.NewServerBind(testBind)
+	ts := dnstest.NewServerBind("example.com. 104 A 127.0.0.1\nexample.com. 104 MX 10 mail.example.com.")
 	defer ts.Close()
 
 	q := dns.Msg{}
@@ -32,9 +34,16 @@ func TestRoundtrip(t *testing.T) {
 	ts := dnstest.NewServerBind(testBind)
 	defer ts.Close()
 
-	q := dns.Msg{}
+	testBody(ts, t)
+}
+
+func testBody(ts *dnstest.Server, t *testing.T) {
+	t.Helper()
+
+	q := &dns.Msg{}
 	q.SetQuestion("example.com.", dns.TypeA)
-	resp, err := dns.Exchange(&q, ts.Addr())
+
+	resp, err := dns.Exchange(q, ts.Addr())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,23 +79,58 @@ func TestRoundtrip(t *testing.T) {
 	}
 }
 
-func benchPrep(tb testing.TB, addr string) (*dns.Client, *dns.Conn) {
-	client := &dns.Client{}
-	conn, err := client.Dial(addr)
+func TestRoundtripHandler(t *testing.T) {
+	handler := func(w dns.ResponseWriter, req *dns.Msg) {
+		resp := &dns.Msg{}
+		resp.SetReply(req)
+		rr, err := dns.NewRR("example.com. 104 A 127.0.0.1")
+		if err != nil {
+			t.Fatalf("Failed to create new RR: %s", err)
+		}
+		resp.Answer = append(resp.Answer, rr)
+		w.WriteMsg(resp)
+	}
+
+	ts := dnstest.NewServer(handler)
+	defer ts.Close()
+
+	testBody(ts, t)
+}
+
+func benchPrep(tb testing.TB, addr string) net.Conn {
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		tb.Fatalf("Failed to resolve UDP address %q: %s", addr, err)
+	}
+	conn, err := net.DialUDP("udp", nil, udpAddr)
 	if err != nil {
 		tb.Fatalf("failed to dial DNS server: %s", err)
 	}
-	return client, conn
+	return conn
 }
 
-func benchBody(tb testing.TB, client *dns.Client, conn *dns.Conn) {
-	m := &dns.Msg{}
+func benchBody(tb testing.TB, conn net.Conn) {
+	m := msgPool.Get().(*dns.Msg)
+	resetMsg(m)
+	defer msgPool.Put(m)
 	m.SetQuestion("example.com.", dns.TypeA)
 	m.RecursionDesired = true
 
-	_, _, err := client.ExchangeWithConn(m, conn)
+	data, err := m.Pack()
 	if err != nil {
-		tb.Fatalf("Failed to exchange with DNS server: %s", err)
+		tb.Fatalf("Failed to pack DNS message: %s", err)
+	}
+
+	_, err = conn.Write(data)
+	if err != nil {
+		tb.Fatalf("Failed to write to DNS server: %s", err)
+	}
+
+	b := bufPool.Get().(*[]byte)
+	defer bufPool.Put(b)
+	_, err = conn.Read(*b)
+	if err != nil {
+		tb.Fatalf("Failed to read from DNS server: %s", err)
 	}
 }
 
@@ -103,10 +147,10 @@ func BenchmarkRPS(b *testing.B) {
 
 	// "single-thread" with single goroutine
 	b.Run("p=0", func(b *testing.B) {
-		client, conn := benchPrep(b, addr)
+		conn := benchPrep(b, addr)
 		defer conn.Close()
 		for b.Loop() {
-			benchBody(b, client, conn)
+			benchBody(b, conn)
 		}
 		benchRPS(b)
 	})
@@ -117,13 +161,18 @@ func BenchmarkRPS(b *testing.B) {
 		b.Run(fmt.Sprintf("p=%d", i), func(b *testing.B) {
 			b.SetParallelism(i)
 			b.RunParallel(func(pb *testing.PB) {
-				client, conn := benchPrep(b, addr)
+				conn := benchPrep(b, addr)
 				defer conn.Close()
 				for pb.Next() {
-					benchBody(b, client, conn)
+					benchBody(b, conn)
 				}
 			})
 			benchRPS(b)
 		})
 	}
 }
+
+var bufPool = sync.Pool{New: func() any { b := make([]byte, dns.MaxMsgSize); return &b }}
+var msgPool = sync.Pool{New: func() any { return &dns.Msg{} }}
+
+func resetMsg(msg *dns.Msg) { *msg = dns.Msg{} }
